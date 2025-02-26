@@ -21,7 +21,6 @@ import (
 	"github.com/google/uuid"
 	"github.com/jmoiron/sqlx"
 	"github.com/shirou/gopsutil/v3/process"
-	"github.com/yandex/mysync/internal/app"
 	"github.com/yandex/mysync/internal/config"
 	"github.com/yandex/mysync/internal/log"
 	"github.com/yandex/mysync/internal/mysql/gtids"
@@ -51,22 +50,57 @@ const (
 
 // NewNode returns new Node
 func NewNode(config *config.Config, logger *log.Logger, host string) (*Node, error) {
+	fmt.Println("Create New node")
 	addr := util.JoinHostPort(host, config.MySQL.Port)
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/mysql", config.MySQL.User, config.MySQL.Password, addr)
 	if config.MySQL.SslCA != "" {
 		dsn += "?tls=custom"
 	}
+
 	db, err := sqlx.Open("mysql", dsn)
-  db.MustExec("SET session autocommit=true;")
 	if err != nil {
 		return nil, err
 	}
+
 	// Unsafe option allow us to use queries containing fields missing in structs
 	// eg. when we running "SHOW SLAVE STATUS", but need only few columns
 	db = db.Unsafe()
 	db.SetMaxIdleConns(1)
 	db.SetMaxOpenConns(3)
 	db.SetConnMaxLifetime(3 * config.TickInterval)
+
+	// ENABLE AUTOCOMMIT
+	_, err = db.Exec(DefaultQueries[queryEnableSessionAutocommit])
+
+	if err != nil {
+		return nil, err
+	}
+
+	// MAKE COMMIT
+	_, err = db.Exec(DefaultQueries[querryCommit])
+
+	if err != nil {
+		return nil, err
+	}
+
+	var autocommit int
+
+	// SESSION AUTOCOMMIT CHECK
+	err = db.QueryRow("SELECT @@session.autocommit").Scan(&autocommit)
+	if err != nil {
+		logger.Debugf("failed to query autocommit: %v", err)
+	}
+
+	logger.Debugf("SESSION autocommit value: %d\n", autocommit)
+
+	// GLOBAL AUTOCOMMIT CHECK
+	err = db.QueryRow("SELECT @@global.autocommit").Scan(&autocommit)
+	if err != nil {
+		logger.Debugf("failed to query autocommit: %v", err)
+	}
+
+	logger.Debugf("GLOBAL autocommit value: %d\n", autocommit)
+
 	return &Node{
 		config:  config,
 		logger:  logger,
@@ -267,6 +301,7 @@ func (n *Node) exec(queryName string, arg map[string]interface{}) error {
 }
 
 func (n *Node) getRunningQueryIDs(excludeUsers []string, timeout time.Duration) ([]int, error) {
+	n.logger.Debug("Enter in getRunningQueryIDs")
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
@@ -298,6 +333,94 @@ func (n *Node) getRunningQueryIDs(excludeUsers []string, timeout time.Duration) 
 	n.traceQuery(bquery, args, ret, nil)
 
 	return ret, nil
+}
+
+func (n *Node) getQueryIDs() ([]int, error) {
+	n.logger.Debug("Enter in getQueryIDs")
+
+	query := "SELECT ID FROM information_schema.PROCESSLIST"
+
+	rows, err := n.db.Queryx(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ret []int
+
+	for rows.Next() {
+		var currid int
+		err := rows.Scan(&currid)
+		if err != nil {
+			return nil, err
+		}
+		ret = append(ret, currid)
+	}
+
+	return ret, nil
+}
+
+func (n *Node) getDataLocks() ([]DataLock, error) {
+	n.logger.Debug("Enter in getDataLocks")
+
+	query := `
+        SELECT 
+            ENGINE, 
+            ENGINE_LOCK_ID, 
+            ENGINE_TRANSACTION_ID, 
+            THREAD_ID, 
+            OBJECT_SCHEMA, 
+            OBJECT_NAME, 
+            LOCK_TYPE, 
+            LOCK_MODE, 
+            LOCK_STATUS 
+        FROM performance_schema.data_locks 
+        WHERE ENGINE = 'INNODB'
+    `
+
+	rows, err := n.db.Queryx(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var dataLocks []DataLock
+	for rows.Next() {
+		var dl DataLock
+		err := rows.Scan(
+			&dl.Engine,
+			&dl.EngineLockID,
+			&dl.EngineTransactionID,
+			&dl.ThreadID,
+			&dl.ObjectSchema,
+			&dl.ObjectName,
+			&dl.LockType,
+			&dl.LockMode,
+			&dl.LockStatus,
+		)
+		if err != nil {
+			return nil, err
+		}
+		dataLocks = append(dataLocks, dl)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return dataLocks, nil
+}
+
+// DataLock представляет структуру для хранения данных о блокировках
+type DataLock struct {
+	Engine              string `db:"ENGINE"`
+	EngineLockID        string `db:"ENGINE_LOCK_ID"`
+	EngineTransactionID string `db:"ENGINE_TRANSACTION_ID"`
+	ThreadID            int    `db:"THREAD_ID"`
+	ObjectSchema        string `db:"OBJECT_SCHEMA"`
+	ObjectName          string `db:"OBJECT_NAME"`
+	LockType            string `db:"LOCK_TYPE"`
+	LockMode            string `db:"LOCK_MODE"`
+	LockStatus          string `db:"LOCK_STATUS"`
 }
 
 type schemaname string
@@ -692,6 +815,7 @@ func (n *Node) setReadonlyWithTimeout(superReadOnly bool, timeout time.Duration)
 // this may take a while as client may start new queries
 func (n *Node) SetReadOnlyWithForce(excludeUsers []string, superReadOnly bool) error {
 	// first, we will try to gracefully set host read_only
+	// n.db.Exec("UNLOCK TABLES;")
 	timeouts := []int{2, 4, 8}
 	for i, t := range timeouts {
 		n.logger.Infof("trying set host %s read-only, attempt %d", n.host, i+1)
@@ -706,18 +830,51 @@ func (n *Node) SetReadOnlyWithForce(excludeUsers []string, superReadOnly bool) e
 	quit := make(chan bool)
 	ticker := time.NewTicker(time.Second)
 
+	// Check data_locks
+	locks, err := n.getDataLocks()
+	if err != nil {
+		n.logger.Errorf("Error fetching data locks: %v", err)
+	}
+
+	n.logger.Debugf("Length of data_locks: %d", len(locks))
+	for _, lock := range locks {
+		n.logger.Debugf("Lock ID: %s, Table: %s.%s, Type: %s, Status: %s\n",
+			lock.EngineLockID,
+			lock.ObjectSchema,
+			lock.ObjectName,
+			lock.LockType,
+			lock.LockStatus,
+		)
+	}
+
+	ids, err := n.getRunningQueryIDs(excludeUsers, time.Second)
+	if err == nil {
+		n.logger.Debugf("len running IDS: %d", len(ids))
+		for _, id := range ids {
+			n.logger.Debugf("PID: %d", id)
+		}
+	} else {
+		n.logger.Debugf("getRunningQueryIDs aborted: %s", err)
+	}
+
+	ids, err = n.getQueryIDs()
+	if err == nil {
+		n.logger.Debugf("len IDS: %d", len(ids))
+		for _, id := range ids {
+			n.logger.Debugf("PID: %d", id)
+		}
+	} else {
+		n.logger.Debugf("getQueryIDs aborted: %s", err)
+	}
+
 	go func() {
 		for {
 			ids, err := n.getRunningQueryIDs(excludeUsers, time.Second)
-      n.logger.Debugf("====== runnung Queries IDs =======")
 			if err == nil {
 				for _, id := range ids {
-          n.logger.Debugf("id: ", id)
 					_ = n.exec(queryKillQuery, map[string]interface{}{"kill_id": strconv.Itoa(id)})
 				}
 			}
-      n.logger.Debugf("==================================")
-
 			select {
 			case <-quit:
 				return

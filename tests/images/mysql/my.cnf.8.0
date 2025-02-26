@@ -16,6 +16,7 @@ quote-names
 max_allowed_packet = 16M
 
 [mysqld]
+init_connect='set @@global.autocommit=0'
 plugin_load_add = 'rpl_semi_sync_master=semisync_master.so;rpl_semi_sync_slave=semisync_slave.so'
 default_authentication_plugin=mysql_native_password # no ssl in docker
 user = mysql

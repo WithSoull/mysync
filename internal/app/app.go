@@ -655,7 +655,6 @@ func (app *App) stateManager() appState {
 		}
 		return stateMaintenance
 	}
-
 	// check if switchover required or in progress
 	switchover := new(Switchover)
 	if err := app.dcs.Get(pathCurrentSwitch, switchover); err == nil {

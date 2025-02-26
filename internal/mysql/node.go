@@ -50,7 +50,6 @@ const (
 
 // NewNode returns new Node
 func NewNode(config *config.Config, logger *log.Logger, host string) (*Node, error) {
-	fmt.Println("Create New node")
 	addr := util.JoinHostPort(host, config.MySQL.Port)
 	dsn := fmt.Sprintf("%s:%s@tcp(%s)/mysql", config.MySQL.User, config.MySQL.Password, addr)
 	if config.MySQL.SslCA != "" {

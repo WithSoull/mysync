@@ -41,7 +41,6 @@ const (
 	queryChangeSource                   = "change_source"
 	queryResetReplicaAll                = "reset_replica_all"
 	queryEnableSessionAutocommit        = "enable_session_autocommit"
-	querryCommit                        = "commit"
 	queryStopReplica                    = "stop_replica"
 	queryStartReplica                   = "start_replica"
 	queryIgnoreDB                       = "ignore_db"
@@ -78,8 +77,7 @@ var DefaultQueries = map[string]string{
 	queryStartSlaveSQLThread:     `START SLAVE SQL_THREAD FOR CHANNEL :channel`,
 	queryResetSlaveAll:           `RESET SLAVE ALL FOR CHANNEL :channel`,
 	queryResetReplicaAll:         `RESET REPLICA ALL FOR CHANNEL :channel`,
-	queryEnableSessionAutocommit: `SET @@autocommit = 1`,
-	querryCommit:                 `COMMIT`,
+	queryEnableSessionAutocommit: `SET SESSION autocommit = 1`,
 	queryChangeMaster: `CHANGE MASTER TO
 								MASTER_HOST = :host ,
 								MASTER_PORT = :port ,
